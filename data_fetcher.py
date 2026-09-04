@@ -13,12 +13,21 @@ FD_BASE = "https://api.football-data.org/v4"
 
 
 def get_upcoming_odds(league_key: str):
-    """Returnează lista de meciuri viitoare cu cote 1X2, totaluri și BTTS."""
+    """
+    Returnează lista de meciuri viitoare cu cote 1X2 și totaluri (Over/Under).
+
+    NOTĂ: BTTS (ambele echipe marchează) NU poate fi cerut aici - The Odds API
+    tratează btts ca "piață suplimentară", disponibilă doar printr-un endpoint
+    separat, per meci individual (/events/{id}/odds), nu în cererea în bloc.
+    Includerea lui aici cauzează eroare 422 pentru toată cererea. Botul
+    calculează în continuare o probabilitate BTTS din propriul model
+    (Poisson) chiar dacă nu avem cota bookmakerului pentru acea piață.
+    """
     url = f"{ODDS_BASE}/sports/{league_key}/odds"
     params = {
         "apiKey": config.ODDS_API_KEY,
         "regions": "eu",
-        "markets": "h2h,totals,btts",
+        "markets": "h2h,totals",
         "oddsFormat": "decimal",
     }
     try:
