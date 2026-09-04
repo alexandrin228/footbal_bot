@@ -8,8 +8,20 @@ de cornere (doar scoruri). Momentan folosim o medie de ligă implicită
 (DEFAULT_CORNERS_AVG în acest fișier) ca aproximare. Dacă vrei cornere reale
 per echipă, trebuie conectată o sursă suplimentară (ex. API-Football pe
 RapidAPI) în data_fetcher.py - pot să te ajut când ajungi acolo.
+
+NOTĂ despre deploy: planul gratuit Render pentru "Background Worker" poate
+necesita plată în anumite cazuri. Ca alternativă gratuită, rulăm botul ca
+"Web Service": pornim un mic server HTTP (doar răspunde "OK", nu face nimic
+altceva) pe portul cerut de Render, într-un fir separat, în timp ce bucla
+principală de analiză rulează normal mai jos. Un serviciu extern gratuit de
+"ping" (ex. cron-job.org sau UptimeRobot) trebuie configurat să acceseze
+URL-ul public al botului la fiecare ~10 minute, ca să nu adoarmă din
+inactivitate.
 """
+import os
 import time
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 
 import config
@@ -18,6 +30,24 @@ import model
 import telegram_bot
 
 DEFAULT_CORNERS_AVG = 10.0  # medie generică ligi mari europene, folosită ca fallback
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Football bot is running.")
+
+    def log_message(self, format, *args):
+        pass  # nu murdărim logurile cu fiecare ping
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    print(f"[main] Server de sanatate pornit pe portul {port} (pentru Render).")
+    server.serve_forever()
 
 
 def process_league(league_key: str):
@@ -119,6 +149,11 @@ def run_once():
 
 
 if __name__ == "__main__":
+    # Pornim serverul de "sănătate" într-un fir separat, ca Render să vadă
+    # un port deschis (cerință pentru Web Service). Botul propriu-zis rulează
+    # mai departe, normal, în firul principal.
+    threading.Thread(target=start_health_server, daemon=True).start()
+
     while True:
         run_once()
         print(f"[main] Aștept {config.CHECK_INTERVAL_MINUTES} minute până la următoarea verificare...")
