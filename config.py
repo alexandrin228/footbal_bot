@@ -33,8 +33,19 @@ FOOTBALL_DATA_COMPETITIONS = {
     "soccer_france_ligue_one": "FL1",
 }
 
-# Câte meciuri recente să folosească pentru calculul mediei de goluri/cornere
-FORM_MATCHES = 6
+# Mapare cod football-data.co.uk (SURSĂ NOUĂ, gratuită, fără cheie API) - oferă
+# cornere, cartonașe, șuturi și faulturi REALE per meci, ceva ce football-data.org
+# (planul gratuit) nu oferă deloc. Coduri diferite de cele de mai sus!
+FOOTBALL_DATA_CO_UK_DIVISIONS = {
+    "soccer_epl": "E0",
+    "soccer_spain_la_liga": "SP1",
+    "soccer_italy_serie_a": "I1",
+    "soccer_germany_bundesliga": "D1",
+    "soccer_france_ligue_one": "F1",
+}
+
+# Câte meciuri recente să folosească pentru calculul mediei de goluri/cornere/cartonașe
+FORM_MATCHES = 8
 
 # Prag minim de "value" (diferență între probabilitatea modelului și cea implicită
 # a cotei) ca să trimitem alertă. 0.05 = 5 puncte procentuale.
