@@ -1,22 +1,12 @@
 """
 Punct de intrare. Rulează în buclă: la fiecare CHECK_INTERVAL_MINUTES,
 ia meciurile viitoare din următoarele 48h pentru fiecare ligă configurată,
-calculează probabilitățile și trimite pe Telegram doar meciurile cu "value".
+calculează probabilitățile (model îmbunătățit, 3 surse de date - vezi
+model.py și data_fetcher.py) și trimite pe Telegram doar meciurile cu "value".
 
-NOTĂ despre cornere: planul gratuit al football-data.org NU oferă statistici
-de cornere (doar scoruri). Momentan folosim o medie de ligă implicită
-(DEFAULT_CORNERS_AVG în acest fișier) ca aproximare. Dacă vrei cornere reale
-per echipă, trebuie conectată o sursă suplimentară (ex. API-Football pe
-RapidAPI) în data_fetcher.py - pot să te ajut când ajungi acolo.
-
-NOTĂ despre deploy: planul gratuit Render pentru "Background Worker" poate
-necesita plată în anumite cazuri. Ca alternativă gratuită, rulăm botul ca
-"Web Service": pornim un mic server HTTP (doar răspunde "OK", nu face nimic
-altceva) pe portul cerut de Render, într-un fir separat, în timp ce bucla
-principală de analiză rulează normal mai jos. Un serviciu extern gratuit de
-"ping" (ex. cron-job.org sau UptimeRobot) trebuie configurat să acceseze
-URL-ul public al botului la fiecare ~10 minute, ca să nu adoarmă din
-inactivitate.
+NOTĂ despre deploy: rulăm ca "Web Service" gratuit pe Render (nu Background
+Worker), cu un mic server HTTP care satisface cerința de port, + un serviciu
+extern de ping (cron-job.org) care ține botul treaz.
 """
 import os
 import time
@@ -28,8 +18,6 @@ import config
 import data_fetcher
 import model
 import telegram_bot
-
-DEFAULT_CORNERS_AVG = 10.0  # medie generică ligi mari europene, folosită ca fallback
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -53,6 +41,19 @@ def start_health_server():
 def process_league(league_key: str):
     events = data_fetcher.get_upcoming_odds(league_key)
     competition_code = config.FOOTBALL_DATA_COMPETITIONS.get(league_key)
+    division_code = config.FOOTBALL_DATA_CO_UK_DIVISIONS.get(league_key)
+
+    # Câte O SINGURĂ cerere per sursă per ligă - reutilizate pentru toate
+    # fixture-urile de mai jos (formă, head-to-head, medie ligă, cornere, cartonașe).
+    all_matches = data_fetcher.get_competition_matches(competition_code)
+    data_fetcher.throttle()
+    extended_rows = data_fetcher.get_extended_stats_csv(division_code)
+
+    if not all_matches:
+        print(f"[main] Fără date de la football-data.org pentru {league_key}, sar peste.")
+        return
+
+    league_home_avg, league_away_avg = model.league_reference_averages(all_matches)
 
     for event in events:
         home = event.get("home_team")
@@ -61,18 +62,28 @@ def process_league(league_key: str):
         if not home or not away:
             continue
 
-        # --- statistici recente pentru model ---
-        home_matches = data_fetcher.get_team_recent_matches(competition_code, home, config.FORM_MATCHES)
-        data_fetcher.throttle()
-        away_matches = data_fetcher.get_team_recent_matches(competition_code, away, config.FORM_MATCHES)
-        data_fetcher.throttle()
+        # --- formă recentă + head-to-head (football-data.org) ---
+        home_matches = data_fetcher.filter_team_matches(all_matches, home, config.FORM_MATCHES)
+        away_matches = data_fetcher.filter_team_matches(all_matches, away, config.FORM_MATCHES)
+        h2h_matches = data_fetcher.filter_head_to_head(all_matches, home, away)
 
-        home_scored, home_conceded = model.team_average_goals(home_matches, home, side="home")
-        away_scored, away_conceded = model.team_average_goals(away_matches, away, side="away")
-
-        lam_home, lam_away = model.expected_goals(home_scored, home_conceded, away_scored, away_conceded)
+        lam_home, lam_away = model.expected_goals_v2(
+            home_matches, away_matches, home, away,
+            league_home_avg, league_away_avg, h2h_matches=h2h_matches,
+        )
         probs = model.match_probabilities(lam_home, lam_away)
-        probs["corners"] = model.corners_probability(DEFAULT_CORNERS_AVG)
+
+        # --- cornere + cartonașe reale (football-data.co.uk) ---
+        h_cf, h_ca, h_kf, h_ka = data_fetcher.get_team_corner_card_series(extended_rows, home, config.FORM_MATCHES)
+        a_cf, a_ca, a_kf, a_ka = data_fetcher.get_team_corner_card_series(extended_rows, away, config.FORM_MATCHES)
+
+        corners_missing = not h_cf or not a_cf
+        cards_missing = not h_kf or not a_kf
+
+        exp_corners = model.expected_total_corners(h_cf, h_ca, a_cf, a_ca)
+        exp_cards = model.expected_total_cards(h_kf, h_ka, a_kf, a_ka)
+        probs["corners"] = model.corners_probability(exp_corners, is_estimated=corners_missing)
+        probs["cards"] = model.cards_probability(exp_cards, is_estimated=cards_missing)
 
         # --- extrage cele mai bune cote disponibile din bookmakerii returnați ---
         best_odds = extract_best_odds(event)
@@ -149,9 +160,6 @@ def run_once():
 
 
 if __name__ == "__main__":
-    # Pornim serverul de "sănătate" într-un fir separat, ca Render să vadă
-    # un port deschis (cerință pentru Web Service). Botul propriu-zis rulează
-    # mai departe, normal, în firul principal.
     threading.Thread(target=start_health_server, daemon=True).start()
 
     while True:
