@@ -1,4 +1,4 @@
-  """
+"""
 Model statistic bazat pe distribuția Poisson, cu îmbunătățiri față de versiunea
 inițială (naivă):
 
