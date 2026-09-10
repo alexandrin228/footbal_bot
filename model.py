@@ -274,3 +274,90 @@ def find_value(model_prob: float, market_odds: float, threshold: float):
             "odds": market_odds,
         }
     return None
+
+
+# =============================================================================
+# ENSEMBLE: 3 modele independente pentru 1X2 (formă, Elo, piață) + acord
+#
+# ONESTITATE IMPORTANTĂ: nu există date gratuite reale pentru xG, accidentări,
+# formații sau un "model AI contextual" - orice ar afișa asemenea module ar fi
+# fie inventat, fie mereu "NECONFIRMAT". De-aia ensemble-ul de mai jos are
+# 3 modele, nu 5: sunt singurele calculabile din date reale, verificabile,
+# fără cost. Modelul "Formă" NU e xG real (doar goluri efectiv marcate).
+# =============================================================================
+
+ELO_HOME_ADVANTAGE = 60     # puncte Elo bonus pentru echipa gazdă (convenție comună)
+ELO_GOALS_PER_POINT = 250   # aproximare: ~250 puncte Elo diferență ≈ 1 gol diferență
+                            # așteptată. E o aproximare rezonabilă din practica
+                            # open-source, NU o constantă oficială universală -
+                            # poate fi ajustată ulterior, pe măsură ce acumulați
+                            # rezultate reale de comparat.
+
+
+def elo_model_probabilities(elo_home: float, elo_away: float, league_total_avg: float, max_goals: int = 8):
+    """
+    MODEL B (Elo): transformă diferența de rating Elo într-o supremație de
+    goluri așteptată, apoi o combină cu media totală de goluri a ligii ca să
+    obțină goluri așteptate separate pentru fiecare echipă, rulate prin
+    aceeași distribuție Poisson. Returnează None dacă lipsește Elo-ul uneia
+    dintre echipe (nu ghicim).
+    """
+    if elo_home is None or elo_away is None:
+        return None
+    goal_diff = ((elo_home + ELO_HOME_ADVANTAGE) - elo_away) / ELO_GOALS_PER_POINT
+    base = league_total_avg / 2
+    lam_home = max(0.3, min(base + goal_diff / 2, 4.5))
+    lam_away = max(0.3, min(base - goal_diff / 2, 4.5))
+    return match_probabilities(lam_home, lam_away, max_goals=max_goals)["1x2"]
+
+
+def market_devigged_probabilities(home_odds: float, draw_odds: float, away_odds: float):
+    """
+    MODEL C (Piață): elimină marja bookmakerului (overround), împărțind
+    proporțional între cele 3 rezultate posibile, ca probabilitățile să
+    însumeze exact 100%. Returnează None dacă lipsește vreo cotă.
+    """
+    if not (home_odds and draw_odds and away_odds):
+        return None
+    raw = {"home": 1 / home_odds, "draw": 1 / draw_odds, "away": 1 / away_odds}
+    total = sum(raw.values())  # > 1.0 din cauza marjei bookmakerului
+    if total <= 0:
+        return None
+    return {k: v / total for k, v in raw.items()}
+
+
+def ensemble_agreement(models: dict):
+    """
+    Primește un dict {nume_model: {"home":.., "draw":.., "away":..} sau None}.
+    Calculează media modelelor DISPONIBILE (probabilitatea finală afișată) și
+    un scor de acord (0-100) bazat pe cât de împrăștiate sunt estimările lor
+    de victorie a gazdelor. Puține modele disponibile = acord marcat explicit
+    ca nedeterminabil, nu inventat.
+    """
+    available = {name: p for name, p in models.items() if p is not None}
+    if len(available) < 2:
+        return {"available": available, "ensemble": None, "score": None, "label": "DATE INSUFICIENTE"}
+
+    ensemble = {
+        outcome: sum(p[outcome] for p in available.values()) / len(available)
+        for outcome in ("home", "draw", "away")
+    }
+
+    home_values = [p["home"] for p in available.values()]
+    mean_h = sum(home_values) / len(home_values)
+    variance = sum((v - mean_h) ** 2 for v in home_values) / len(home_values)
+    std_dev = variance ** 0.5
+
+    score = max(0, min(100, round(100 - std_dev * 500)))
+    if score >= 90:
+        label = "FOARTE RIDICAT"
+    elif score >= 75:
+        label = "RIDICAT"
+    elif score >= 60:
+        label = "MODERAT"
+    elif score >= 40:
+        label = "SCĂZUT"
+    else:
+        label = "FOARTE SCĂZUT"
+
+    return {"available": available, "ensemble": ensemble, "score": score, "label": label}
