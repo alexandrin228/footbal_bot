@@ -1,12 +1,13 @@
 """
 Punct de intrare. Rulează în buclă: la fiecare CHECK_INTERVAL_MINUTES,
 ia meciurile viitoare din următoarele 48h pentru fiecare ligă configurată,
-calculează probabilitățile (model îmbunătățit, 3 surse de date - vezi
-model.py și data_fetcher.py) și trimite pe Telegram doar meciurile cu "value".
+calculează probabilitățile printr-un ENSEMBLE de 3 modele independente
+(formă/Poisson, Elo, piață de-vigged) pentru 1X2, plus Over/Under, BTTS,
+cornere și cartonașe (model unic - vezi limitări în model.py), și trimite
+pe Telegram doar meciurile cu "value" real față de cotele curente.
 
-NOTĂ despre deploy: rulăm ca "Web Service" gratuit pe Render (nu Background
-Worker), cu un mic server HTTP care satisface cerința de port, + un serviciu
-extern de ping (cron-job.org) care ține botul treaz.
+NOTĂ despre deploy: rulăm ca "Web Service" gratuit pe Render, cu un mic
+server HTTP intern + un serviciu extern de ping (cron-job.org).
 """
 import os
 import time
@@ -28,7 +29,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Football bot is running.")
 
     def log_message(self, format, *args):
-        pass  # nu murdărim logurile cu fiecare ping
+        pass
 
 
 def start_health_server():
@@ -38,13 +39,11 @@ def start_health_server():
     server.serve_forever()
 
 
-def process_league(league_key: str):
+def process_league(league_key: str, elo_rows: list):
     events = data_fetcher.get_upcoming_odds(league_key)
     competition_code = config.FOOTBALL_DATA_COMPETITIONS.get(league_key)
     division_code = config.FOOTBALL_DATA_CO_UK_DIVISIONS.get(league_key)
 
-    # Câte O SINGURĂ cerere per sursă per ligă - reutilizate pentru toate
-    # fixture-urile de mai jos (formă, head-to-head, medie ligă, cornere, cartonașe).
     all_matches = data_fetcher.get_competition_matches(competition_code)
     data_fetcher.throttle()
     extended_rows = data_fetcher.get_extended_stats_csv(division_code)
@@ -54,6 +53,7 @@ def process_league(league_key: str):
         return
 
     league_home_avg, league_away_avg = model.league_reference_averages(all_matches)
+    league_total_avg = league_home_avg + league_away_avg
 
     for event in events:
         home = event.get("home_team")
@@ -62,7 +62,9 @@ def process_league(league_key: str):
         if not home or not away:
             continue
 
-        # --- formă recentă + head-to-head (football-data.org) ---
+        best_odds = extract_best_odds(event)
+
+        # --- MODEL A: formă recentă + head-to-head (football-data.org) ---
         home_matches = data_fetcher.filter_team_matches(all_matches, home, config.FORM_MATCHES)
         away_matches = data_fetcher.filter_team_matches(all_matches, away, config.FORM_MATCHES)
         h2h_matches = data_fetcher.filter_head_to_head(all_matches, home, away)
@@ -73,33 +75,46 @@ def process_league(league_key: str):
         )
         probs = model.match_probabilities(lam_home, lam_away)
 
+        # --- MODEL B: Elo (clubelo.com) ---
+        elo_home = data_fetcher.get_team_elo(elo_rows, home)
+        elo_away = data_fetcher.get_team_elo(elo_rows, away)
+        elo_probs = model.elo_model_probabilities(elo_home, elo_away, league_total_avg)
+
+        # --- MODEL C: piață (de-vigged) ---
+        market_probs = model.market_devigged_probabilities(
+            best_odds.get("home"), best_odds.get("draw"), best_odds.get("away")
+        )
+
+        agreement = model.ensemble_agreement({"Formă": probs["1x2"], "Elo": elo_probs, "Piață": market_probs})
+        probs["agreement"] = agreement
+        # Pentru 1X2 folosim probabilitatea ENSEMBLE (dacă avem ≥2 modele) - mai
+        # robustă decât un singur model. Dacă nu, revenim la modelul de formă.
+        final_1x2 = agreement["ensemble"] if agreement["ensemble"] else probs["1x2"]
+
         # --- cornere + cartonașe reale (football-data.co.uk) ---
         h_cf, h_ca, h_kf, h_ka = data_fetcher.get_team_corner_card_series(extended_rows, home, config.FORM_MATCHES)
         a_cf, a_ca, a_kf, a_ka = data_fetcher.get_team_corner_card_series(extended_rows, away, config.FORM_MATCHES)
-
         corners_missing = not h_cf or not a_cf
         cards_missing = not h_kf or not a_kf
-
         exp_corners = model.expected_total_corners(h_cf, h_ca, a_cf, a_ca)
         exp_cards = model.expected_total_cards(h_kf, h_ka, a_kf, a_ka)
         probs["corners"] = model.corners_probability(exp_corners, is_estimated=corners_missing)
         probs["cards"] = model.cards_probability(exp_cards, is_estimated=cards_missing)
 
-        # --- extrage cele mai bune cote disponibile din bookmakerii returnați ---
-        best_odds = extract_best_odds(event)
-
-        # --- caută value bets pe piețele cu cote disponibile ---
+        # --- value bets: 1X2 folosește ensemble-ul; O/U și BTTS folosesc doar
+        # modelul de formă (singurul disponibil pentru acele piețe - onest, nu
+        # ensemble fals) ---
         value_bets = []
         if best_odds.get("home"):
-            v = model.find_value(probs["1x2"]["home"], best_odds["home"], config.VALUE_THRESHOLD)
+            v = model.find_value(final_1x2["home"], best_odds["home"], config.VALUE_THRESHOLD)
             if v:
                 value_bets.append({**v, "market": f"Victorie {home}"})
         if best_odds.get("draw"):
-            v = model.find_value(probs["1x2"]["draw"], best_odds["draw"], config.VALUE_THRESHOLD)
+            v = model.find_value(final_1x2["draw"], best_odds["draw"], config.VALUE_THRESHOLD)
             if v:
                 value_bets.append({**v, "market": "Egal"})
         if best_odds.get("away"):
-            v = model.find_value(probs["1x2"]["away"], best_odds["away"], config.VALUE_THRESHOLD)
+            v = model.find_value(final_1x2["away"], best_odds["away"], config.VALUE_THRESHOLD)
             if v:
                 value_bets.append({**v, "market": f"Victorie {away}"})
         if best_odds.get("over_2.5"):
@@ -111,7 +126,6 @@ def process_league(league_key: str):
             if v:
                 value_bets.append({**v, "market": "BTTS Da"})
 
-        # Trimitem doar meciurile care au cel puțin un value bet, ca să nu spămăm canalul.
         if value_bets:
             msg = telegram_bot.format_match_report(home, away, kickoff, probs, value_bets)
             telegram_bot.send_message(msg)
@@ -152,9 +166,11 @@ def extract_best_odds(event: dict) -> dict:
 
 def run_once():
     print(f"[main] Rulare la {datetime.now(timezone.utc).isoformat()}")
+    # Clasamentul Elo e comun tuturor ligilor - o singură cerere per rulare completă.
+    elo_rows = data_fetcher.get_elo_ratings()
     for league in config.LEAGUES:
         try:
-            process_league(league)
+            process_league(league, elo_rows)
         except Exception as e:
             print(f"[main] Eroare la procesarea ligii {league}: {e}")
 
