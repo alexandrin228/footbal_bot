@@ -1,14 +1,17 @@
 """
-Preia date brute din trei surse externe:
+Preia date brute din patru surse externe:
  - The Odds API       -> cote în timp real (1X2, Over/Under)
  - football-data.org  -> rezultate recente (formă, goluri), necesită cheie API
  - football-data.co.uk -> cornere, cartonașe, șuturi, faulturi REALE per meci,
-                          sursă complet gratuită, FĂRĂ cheie API, actualizată
-                          constant pe durata sezonului curent.
+                          sursă gratuită, FĂRĂ cheie API.
+ - clubelo.com        -> rating Elo per echipă (folosit și în cercetare
+                          academică pentru predicții fotbalistice), sursă
+                          gratuită, FĂRĂ cheie API.
 
 NOTĂ de eficiență: pentru fiecare ligă, luăm O SINGURĂ DATĂ toate meciurile
 finalizate (din fiecare sursă), apoi filtrăm local (fără cereri noi) forma
-fiecărei echipe, head-to-head, cornere și cartonașe.
+fiecărei echipe, head-to-head, cornere și cartonașe. Clasamentul Elo e
+comun tuturor ligilor, deci se ia o singură dată per rulare completă.
 """
 import csv
 import difflib
@@ -23,6 +26,7 @@ import config
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 FD_BASE = "https://api.football-data.org/v4"
 FD_CO_UK_BASE = "https://www.football-data.co.uk"
+CLUBELO_BASE = "http://api.clubelo.com"
 
 
 # =============================================================================
@@ -234,3 +238,52 @@ def get_team_corner_card_series(all_rows: list, team_name: str, limit: int = 8):
         if len(corners_for) >= limit:
             break
     return corners_for, corners_against, cards_for, cards_against
+
+
+# =============================================================================
+# CLUBELO.COM (rating Elo per echipă - MODEL independent, gratuit, fără cheie)
+# =============================================================================
+
+def get_elo_ratings():
+    """
+    O singură cerere: clasamentul Elo complet de azi, pentru toate echipele
+    acoperite de clubelo.com (ligile mari europene incluse). Comun tuturor
+    ligilor - se ia o singură dată per rulare, nu per ligă.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    url = f"{CLUBELO_BASE}/{today}"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; football-bot/1.0)"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+        reader = csv.DictReader(io.StringIO(resp.text))
+        return list(reader)
+    except requests.RequestException as e:
+        print(f"[data_fetcher] Eroare clubelo.com: {e}")
+        return []
+    except Exception as e:
+        print(f"[data_fetcher] Eroare la parsarea datelor Elo: {e}")
+        return []
+
+
+def get_team_elo(elo_rows: list, team_name: str):
+    """
+    Caută ratingul Elo al unei echipe, cu aceeași potrivire flexibilă de nume
+    folosită la cornere/cartonașe. Returnează None dacă echipa nu e găsită
+    (ex. ligă/echipă neacoperită de clubelo.com) - modelul Elo va lipsi atunci
+    pentru acel meci, marcat transparent, nu ghicit.
+    """
+    if not elo_rows:
+        return None
+    target = _normalize_team_name(team_name)
+    all_names = {_normalize_team_name(r.get("Club", "")) for r in elo_rows}
+    matched = _find_best_team_match(target, all_names)
+    if not matched:
+        return None
+    for r in elo_rows:
+        if _normalize_team_name(r.get("Club", "")) == matched:
+            try:
+                return float(r["Elo"])
+            except (ValueError, KeyError):
+                return None
+    return None
